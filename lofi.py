@@ -73,13 +73,11 @@ def _eq_color(zone: float) -> str:
 def load_config() -> dict:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        return json.loads(CONFIG_FILE.read_text())
+        cfg = json.loads(CONFIG_FILE.read_text())
+        cfg.setdefault("stations", [])
+        return cfg
     except Exception:
-        return {"last_url": "", "last_title": ""}
-
-def save_config(url: str, title: str) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps({"last_url": url, "last_title": title}))
+        return {"last_url": "", "last_title": "", "stations": []}
 
 
 # ── URL resolution & title fetching ──────────────────────────────────────────
@@ -274,7 +272,7 @@ class App(tk.Tk):
         try:
             from AppKit import NSApplication, NSImage
             nsapp = NSApplication.sharedApplication()
-            nsapp.setActivationPolicy_(1)  # NSApplicationActivationPolicyAccessory
+            nsapp.setActivationPolicy_(0)  # NSApplicationActivationPolicyRegular — show dock icon
             icon_path = Path(__file__).parent / "lofi.icns"
             if icon_path.exists():
                 icon = NSImage.alloc().initWithContentsOfFile_(str(icon_path))
@@ -282,16 +280,17 @@ class App(tk.Tk):
                     NSApplication.sharedApplication().setApplicationIconImage_(icon)
         except Exception:
             pass
-        cfg          = load_config()
-        self._url    = cfg["last_url"]
-        self._ttl    = cfg["last_title"]
+        cfg              = load_config()
+        self._url        = cfg["last_url"]
+        self._ttl        = cfg["last_title"]
+        self._stations: list[dict] = cfg["stations"]
         self.player     = Player()
         self.eq         = Equalizer()
         self._play_start:    float | None = None
         self._paused_total:  float        = 0.0
         self._paused_since:  float | None = None
         self._resolving: bool             = False
-        self._cache: dict[str, tuple[str, str, float]] = {}  # url -> (stream, title, expires)
+        self._cache: dict[str, tuple[str, str, float]] = {}
         if self._url:
             threading.Thread(target=self._bg_pre_resolve, args=(self._url,), daemon=True).start()
         self._build()
@@ -347,7 +346,7 @@ class App(tk.Tk):
 
         # ── Title row ─────────────────────────────────────────────────────────
         ttl_row = tk.Frame(self, bg=BG)
-        ttl_row.pack(fill="x", padx=P, pady=(0, 8))
+        ttl_row.pack(fill="x", padx=P, pady=(0, 4))
 
         tk.Label(ttl_row, text="TTL ›", font=F, fg=DIM, bg=BG, width=5,
                  anchor="w").pack(side="left")
@@ -356,6 +355,11 @@ class App(tk.Tk):
             font=F, fg=FG, bg=BG, anchor="w",
         )
         self._ttl_lbl.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        # ── Stations list ─────────────────────────────────────────────────────
+        self._stations_frame = tk.Frame(self, bg=BG)
+        self._stations_frame.pack(fill="x", padx=P)
+        self._rebuild_stations()
 
         # ── EQ canvas ─────────────────────────────────────────────────────────
         self._canvas = tk.Canvas(
@@ -376,7 +380,7 @@ class App(tk.Tk):
             font=F_SM, fg=DIM, bg=BG, anchor="w",
         )
         self._status_lbl.pack(side="left")
-        self._hint_lbl = tk.Label(bot, text="[↵] play  [⎵] pause  [U] url  [T] top ●",
+        self._hint_lbl = tk.Label(bot, text="[↵] play  [⎵] pause  [U] url  [S] save  [T] top ●",
                  font=F_SM, fg=DIM, bg=BG)
         self._hint_lbl.pack(side="right")
 
@@ -387,6 +391,10 @@ class App(tk.Tk):
         self.bind("U",        self._focus_url)
         self.bind("t",        self._toggle_topmost)
         self.bind("T",        self._toggle_topmost)
+        self.bind("s",        self._save_station)
+        self.bind("S",        self._save_station)
+        for i in range(1, 6):
+            self.bind(str(i), lambda e, n=i: self._play_station_num(n))
         self._topmost = True
 
         # ── Drag-to-move (all non-interactive surfaces) ───────────────────────
@@ -397,7 +405,6 @@ class App(tk.Tk):
         self.update_idletasks()
         h = self.winfo_reqheight()
         self.geometry(f"{self.W}x{h}")
-
         self.after(100, self._setup_native_window)
 
     def _setup_native_window(self, attempt: int = 0) -> None:
@@ -531,7 +538,8 @@ class App(tk.Tk):
         self._set_state()
         ttl = title or original_url.rstrip("/").split("/")[-1] or original_url
         self._ttl = ttl
-        save_config(original_url, ttl)
+        self._url = original_url
+        self._save_config()
         self._ttl_lbl.config(text=ttl)
 
     def _on_space(self, _=None) -> None:
@@ -567,7 +575,7 @@ class App(tk.Tk):
         self._topmost = not self._topmost
         self.wm_attributes("-topmost", self._topmost)
         dot = "●" if self._topmost else "○"
-        self._hint_lbl.config(text=f"[↵] play  [⎵] pause  [U] url  [T] top {dot}")
+        self._hint_lbl.config(text=f"[↵] play  [⎵] pause  [U] url  [S] save  [T] top {dot}")
 
     # ── Animation ─────────────────────────────────────────────────────────────
 
@@ -627,6 +635,84 @@ class App(tk.Tk):
         elif not self.player.playing and self._play_start is None and not self._resolving:
             self._status_lbl.config(text="press Enter to play")
         self.after(TICK_MS, self._tick)
+
+    # ── Stations ──────────────────────────────────────────────────────────────
+
+    def _save_config(self) -> None:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        data = {
+            "last_url":   self._url,
+            "last_title": self._ttl,
+            "stations":   self._stations,
+        }
+        CONFIG_FILE.write_text(json.dumps(data, indent=2))
+
+    def _rebuild_stations(self) -> None:
+        for w in self._stations_frame.winfo_children():
+            w.destroy()
+        F = ("Menlo", 9)
+        for i, st in enumerate(self._stations, 1):
+            row = tk.Frame(self._stations_frame, bg=BG)
+            row.pack(fill="x", pady=1)
+            num_lbl = tk.Label(row, text=f"[{i}]", font=F, fg=DIM, bg=BG,
+                               width=4, anchor="w")
+            num_lbl.pack(side="left")
+            raw = st.get("title") or st.get("url", "")
+            title_text = raw if len(raw) <= 55 else raw[:52] + "…"
+            del_btn = tk.Label(row, text="×", font=F, fg=DIM, bg=BG, cursor="hand2",
+                               padx=4)
+            del_btn.pack(side="right")
+            title_lbl = tk.Label(row, text=title_text, font=F, fg=FG, bg=BG,
+                                 anchor="w", cursor="hand2")
+            title_lbl.pack(side="left", fill="x", expand=True, padx=(2, 0))
+            url = st["url"]
+            title_lbl.bind("<Button-1>", lambda e, u=url: self._play_station(u))
+            num_lbl.bind("<Button-1>",   lambda e, u=url: self._play_station(u))
+            del_btn.bind("<Button-1>",   lambda e, idx=i-1: self._remove_station(idx))
+            for w in (title_lbl, num_lbl):
+                w.bind("<Enter>", lambda e, lbl=title_lbl: lbl.config(fg=ACCENT))
+                w.bind("<Leave>", lambda e, lbl=title_lbl: lbl.config(fg=FG))
+            del_btn.bind("<Enter>", lambda e, btn=del_btn: btn.config(fg=ACCENT))
+            del_btn.bind("<Leave>", lambda e, btn=del_btn: btn.config(fg=DIM))
+        self._resize_window()
+
+    def _resize_window(self) -> None:
+        self.update_idletasks()
+        h = self.winfo_reqheight()
+        self.geometry(f"{self.W}x{h}")
+
+    def _save_station(self, _=None) -> None:
+        if self.focus_get() is self._url_entry:
+            return
+        if not self._url or not self.player.playing:
+            return
+        for st in self._stations:
+            if st["url"] == self._url:
+                return
+        if len(self._stations) >= 5:
+            return
+        self._stations.append({"url": self._url, "title": self._ttl or self._url})
+        self._save_config()
+        self._rebuild_stations()
+
+    def _remove_station(self, idx: int) -> None:
+        if 0 <= idx < len(self._stations):
+            self._stations.pop(idx)
+            self._save_config()
+            self._rebuild_stations()
+
+    def _play_station(self, url: str) -> None:
+        self._url_var.set(url)
+        self._url = url
+        self._on_play()
+
+    def _play_station_num(self, n: int) -> None:
+        if self.focus_get() is self._url_entry:
+            return
+        if 1 <= n <= min(5, len(self._stations)):
+            self._play_station(self._stations[n - 1]["url"])
+
+    # ── Close ─────────────────────────────────────────────────────────────────
 
     def _on_close(self) -> None:
         self.player.stop()
