@@ -12,6 +12,21 @@ import time
 import tkinter as tk
 from pathlib import Path
 
+os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")
+
+import shutil as _shutil
+_MPV = _shutil.which("mpv") or "/opt/homebrew/bin/mpv"
+
+def _subprocess_env():
+    """Minimal clean env for subprocesses — avoids py2app vars that corrupt child Python processes."""
+    return {
+        "PATH":   os.environ.get("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"),
+        "HOME":   str(Path.home()),
+        "USER":   os.environ.get("USER", ""),
+        "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+        "LANG":   os.environ.get("LANG", "en_US.UTF-8"),
+    }
+
 CONFIG_DIR  = Path.home() / ".config" / "lofi"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
@@ -65,7 +80,7 @@ def fetch_title(url: str) -> str:
     try:
         r = subprocess.run(
             ["yt-dlp", "--get-title", "--no-playlist", "-q", "--no-warnings", url],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, env=_subprocess_env(),
         )
         if r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip()
@@ -74,7 +89,7 @@ def fetch_title(url: str) -> str:
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", url],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, env=_subprocess_env(),
         )
         if r.returncode == 0:
             tags = json.loads(r.stdout).get("format", {}).get("tags", {})
@@ -101,9 +116,10 @@ class MPV:
     def play(self, url: str) -> None:
         self.stop()
         self._proc = subprocess.Popen(
-            ["mpv", "--no-video", "--no-terminal", "--really-quiet",
+            [_MPV, "--no-video", "--no-terminal", "--really-quiet",
              f"--input-ipc-server={self._sock}", url],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=_subprocess_env(), cwd="/",
         )
         self.playing = True
         self.paused  = False
@@ -231,12 +247,15 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        # Run as an accessory app: window works normally but Python gets no
-        # Dock tile and no Cmd+Tab entry — the parent bash process (lofi.app)
-        # owns those, showing the correct bundle icon.
         try:
-            from AppKit import NSApplication
-            NSApplication.sharedApplication().setActivationPolicy_(1)
+            from AppKit import NSApplication, NSImage
+            nsapp = NSApplication.sharedApplication()
+            nsapp.setActivationPolicy_(1)  # NSApplicationActivationPolicyAccessory
+            icon_path = Path(__file__).parent / "lofi.icns"
+            if icon_path.exists():
+                icon = NSImage.alloc().initWithContentsOfFile_(str(icon_path))
+                if icon:
+                    NSApplication.sharedApplication().setApplicationIconImage_(icon)
         except Exception:
             pass
         cfg          = load_config()
@@ -355,33 +374,41 @@ class App(tk.Tk):
 
         self.after(100, self._setup_native_window)
 
-    def _setup_native_window(self) -> None:
+    def _setup_native_window(self, attempt: int = 0) -> None:
         try:
             from AppKit import NSApplication, NSColor, NSAppearance
             nsapp = NSApplication.sharedApplication()
-            dark  = NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua")
-            bg    = NSColor.colorWithRed_green_blue_alpha_(
+
+            nswin = nsapp.mainWindow() or nsapp.keyWindow()
+            if nswin is None:
+                for w in nsapp.windows():
+                    if w.title() == "lofi":
+                        nswin = w
+                        break
+
+            if nswin is None:
+                if attempt < 8:
+                    self.after(150, lambda: self._setup_native_window(attempt + 1))
+                return
+
+            dark = NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua")
+            bg   = NSColor.colorWithRed_green_blue_alpha_(
                 0x0c/255, 0x0c/255, 0x16/255, 1.0
             )
-            FULL_SIZE = 1 << 15   # NSWindowStyleMaskFullSizeContentView
-            for nswin in nsapp.windows():
-                if nswin.title() == "lofi":
-                    nswin.setStyleMask_(nswin.styleMask() | FULL_SIZE)
-                    nswin.setTitlebarAppearsTransparent_(True)
-                    nswin.setTitleVisibility_(1)
-                    nswin.setMovableByWindowBackground_(True)
-                    nswin.setBackgroundColor_(bg)
-                    nswin.setAppearance_(dark)
+            FULL_SIZE = 1 << 15
+            nswin.setStyleMask_(nswin.styleMask() | FULL_SIZE)
+            nswin.setTitlebarAppearsTransparent_(True)
+            nswin.setTitleVisibility_(1)
+            nswin.setMovableByWindowBackground_(True)
+            nswin.setBackgroundColor_(bg)
+            nswin.setAppearance_(dark)
 
-                    # Centre state label with traffic lights.
-                    # contentLayoutRect gives the area NOT obscured by the titlebar.
-                    content_h  = nswin.contentView().frame().size.height
-                    layout_h   = nswin.contentLayoutRect().size.height
-                    titlebar_h = content_h - layout_h        # typically 28 px
-                    lbl_y      = max(2, round(titlebar_h / 2) - 8)
-                    self._state_lbl.place_configure(y=lbl_y)
-                    self._url_row.pack_configure(pady=(max(28, titlebar_h) + 8, 3))
-                    break
+            content_h  = nswin.contentView().frame().size.height
+            layout_h   = nswin.contentLayoutRect().size.height
+            titlebar_h = content_h - layout_h
+            lbl_y      = max(2, round(titlebar_h / 2) - 8)
+            self._state_lbl.place_configure(y=lbl_y)
+            self._url_row.pack_configure(pady=(max(28, titlebar_h) + 8, 3))
         except Exception:
             pass
 
@@ -547,7 +574,7 @@ def main() -> None:
 
 def _check_mpv() -> bool:
     try:
-        subprocess.run(["mpv", "--version"], capture_output=True, timeout=3)
+        subprocess.run(["mpv", "--version"], capture_output=True, timeout=3, env=_subprocess_env())
         return True
     except (FileNotFoundError, subprocess.TimeoutExpired):
         import tkinter.messagebox as mb

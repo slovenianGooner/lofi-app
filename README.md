@@ -9,22 +9,23 @@ A minimal native macOS app for streaming internet radio and audio URLs, with an 
 - macOS 12 or later
 - Python 3.13
 - [mpv](https://mpv.io/) — audio playback engine
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — optional, used to fetch stream titles
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — needed for YouTube/SoundCloud URLs and title fetching
+- [py2app](https://py2app.readthedocs.io/) — used to build the app bundle
 
-Install dependencies via Homebrew:
+Install dependencies via Homebrew and pip:
 
 ```bash
 brew install mpv yt-dlp
+pip install py2app --break-system-packages
 ```
 
 ## Building the app
 
 ```bash
 ./build.sh
-open lofi.app
 ```
 
-That's it. The script assembles the `lofi.app` bundle from the source files and generates the icon.
+The script generates the icon, builds a proper macOS app bundle via py2app, and offers to install it to `/Applications`.
 
 > On first launch macOS may block the app because it is unsigned. Go to **System Settings → Privacy & Security** and click **Open Anyway**.
 
