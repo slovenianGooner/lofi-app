@@ -17,12 +17,6 @@ rm -rf build dist
 python3.13 setup.py py2app --no-strip 2>&1 | grep -Ev "^running|^creating|^copying|^making|byte-compiling"
 
 if $RELEASE; then
-    echo "Bundling yt-dlp…"
-    YTDLP_BIN="dist/lofi.app/Contents/MacOS/yt-dlp"
-    curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos" -o "$YTDLP_BIN"
-    chmod +x "$YTDLP_BIN"
-    echo "  yt-dlp → $("$YTDLP_BIN" --version)"
-
     VERSION=$(python3.13 -c "
 import re, pathlib
 m = re.search(r'\"CFBundleShortVersionString\":\s*\"([^\"]+)\"', pathlib.Path('setup.py').read_text())

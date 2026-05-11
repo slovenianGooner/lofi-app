@@ -31,10 +31,6 @@ def _subprocess_env():
 
 
 def _yt_dlp_bin() -> str:
-    # Prefer binary bundled inside the .app (release builds)
-    candidate = Path(__file__).parent.parent / "MacOS" / "yt-dlp"
-    if candidate.exists():
-        return str(candidate)
     import shutil
     return shutil.which("yt-dlp") or "/opt/homebrew/bin/yt-dlp"
 

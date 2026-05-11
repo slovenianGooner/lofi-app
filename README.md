@@ -4,34 +4,46 @@ A minimal native macOS app for streaming internet radio and audio URLs, with an 
 
 ![lofi stream player](screenshot.png)
 
-## Requirements
+## Using the release build
 
-- macOS 12 or later
+Download the latest `lofi-vX.X-macos.zip` from [Releases](../../releases), unzip, and move `lofi.app` to `/Applications`.
+
+**Dependency:**
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — required for YouTube URL resolution and title fetching
+
+```bash
+brew install yt-dlp
+```
+
+**First launch:** macOS will block the app because it is unsigned. Go to **System Settings → Privacy & Security** and click **Open Anyway**, then confirm in the dialog that appears.
+
+## Building from source
+
+**Dependencies:**
+
 - Python 3.13
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — URL resolution and title fetching for YouTube and other sites
-- [py2app](https://py2app.readthedocs.io/) — used to build the app bundle
-- [pyobjc-framework-AVFoundation](https://pypi.org/project/pyobjc-framework-AVFoundation/) and [pyobjc-framework-CoreMedia](https://pypi.org/project/pyobjc-framework-CoreMedia/) — native macOS audio playback
-
-Install dependencies:
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+- [py2app](https://py2app.readthedocs.io/)
+- [pyobjc-framework-AVFoundation](https://pypi.org/project/pyobjc-framework-AVFoundation/) and [pyobjc-framework-CoreMedia](https://pypi.org/project/pyobjc-framework-CoreMedia/)
 
 ```bash
 brew install yt-dlp
 pip install py2app pyobjc-framework-AVFoundation pyobjc-framework-CoreMedia --break-system-packages
 ```
 
-## Building the app
+**Build and install to `/Applications`:**
 
 ```bash
 ./build.sh
 ```
 
-The script generates the icon, builds a proper macOS app bundle via py2app, and offers to install it to `/Applications`.
+**Build and publish a GitHub release:**
 
-> On first launch macOS may block the app because it is unsigned. Go to **System Settings → Privacy & Security** and click **Open Anyway**.
+```bash
+./build.sh --release
+```
 
 ## Running without building
-
-You can also run the player directly from the terminal:
 
 ```bash
 python3 lofi.py
