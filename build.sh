@@ -14,7 +14,7 @@ python3.13 make_icon.py
 
 echo "Building lofi.app with py2app…"
 rm -rf build dist
-python3.13 setup.py py2app --no-strip 2>&1 | grep -Ev "^running|^creating|^copying|^making|byte-compiling"
+python3.13 setup.py py2app --no-strip 2>&1 | grep -Ev "^running |^creating |^copying |^making |byte-compiling|^---"
 
 if $RELEASE; then
     VERSION=$(python3.13 -c "
