@@ -2,6 +2,8 @@
 
 A minimal native macOS app for streaming internet radio and audio URLs, with an animated equalizer display.
 
+![lofi stream player](screenshot.png)
+
 ## Requirements
 
 - macOS 12 or later
