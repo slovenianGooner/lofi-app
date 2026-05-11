@@ -8,15 +8,15 @@ A minimal native macOS app for streaming internet radio and audio URLs, with an 
 
 - macOS 12 or later
 - Python 3.13
-- [mpv](https://mpv.io/) — audio playback engine
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — needed for YouTube/SoundCloud URLs and title fetching
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — URL resolution and title fetching for YouTube and other sites
 - [py2app](https://py2app.readthedocs.io/) — used to build the app bundle
+- [pyobjc-framework-AVFoundation](https://pypi.org/project/pyobjc-framework-AVFoundation/) and [pyobjc-framework-CoreMedia](https://pypi.org/project/pyobjc-framework-CoreMedia/) — native macOS audio playback
 
-Install dependencies via Homebrew and pip:
+Install dependencies:
 
 ```bash
-brew install mpv yt-dlp
-pip install py2app --break-system-packages
+brew install yt-dlp
+pip install py2app pyobjc-framework-AVFoundation pyobjc-framework-CoreMedia --break-system-packages
 ```
 
 ## Building the app
@@ -44,8 +44,15 @@ python3 lofi.py
 | `U` | Focus the URL field |
 | `↵` | Play the entered URL |
 | `Space` | Pause / resume |
+| `T` | Toggle always-on-top |
 
-Paste any direct audio stream URL or a YouTube/SoundCloud URL into the URL field and press Enter. The last played URL is remembered between sessions.
+Paste any direct audio stream URL or a YouTube URL into the URL field and press Enter. The last played URL is remembered between sessions.
+
+On first play of a URL, resolution takes ~10–15 seconds while yt-dlp fetches the stream. Subsequent plays of the same URL are instant — the resolved stream URL is cached for its full validity period (~6 hours for YouTube). The app also pre-resolves the saved URL in the background on launch, so it is usually ready by the time you press Enter.
+
+## How it works
+
+Audio is played natively via macOS **AVFoundation** (`AVPlayer`) — no external player binary required. For YouTube URLs, yt-dlp resolves the HLS stream URL and fetches the title in a single call before handing it off to AVPlayer.
 
 ## Configuration
 

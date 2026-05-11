@@ -5,7 +5,7 @@ import json
 import math
 import os
 import random
-import socket
+import re
 import subprocess
 import threading
 import time
@@ -14,8 +14,10 @@ from pathlib import Path
 
 os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")
 
-import shutil as _shutil
-_MPV = _shutil.which("mpv") or "/opt/homebrew/bin/mpv"
+from Foundation import NSURL
+from AVFoundation import AVPlayer, AVPlayerItem
+from CoreMedia import CMTimeGetSeconds
+
 
 def _subprocess_env():
     """Minimal clean env for subprocesses — avoids py2app vars that corrupt child Python processes."""
@@ -26,6 +28,12 @@ def _subprocess_env():
         "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
         "LANG":   os.environ.get("LANG", "en_US.UTF-8"),
     }
+
+
+def _yt_dlp_bin() -> str:
+    import shutil
+    return shutil.which("yt-dlp") or "/opt/homebrew/bin/yt-dlp"
+
 
 CONFIG_DIR  = Path.home() / ".config" / "lofi"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -74,101 +82,117 @@ def save_config(url: str, title: str) -> None:
     CONFIG_FILE.write_text(json.dumps({"last_url": url, "last_title": title}))
 
 
-# ── Title fetching ────────────────────────────────────────────────────────────
+# ── URL resolution & title fetching ──────────────────────────────────────────
 
-def fetch_title(url: str) -> str:
+_FMT = "91/92/93/140/bestaudio[ext=m4a]/bestaudio/best"
+_EXPIRE_RE = re.compile(r'/expire/(\d+)/')
+
+
+def _stream_expires(url: str) -> float:
+    """Extract expiry unix timestamp from a Google CDN URL, or 0 if not found."""
+    m = _EXPIRE_RE.search(url)
+    return float(m.group(1)) if m else 0.0
+
+
+def resolve_and_get_title(url: str) -> tuple[str, str]:
+    """Return (stream_url, title) via yt-dlp. Falls back to (url, '') on failure."""
+    ytdlp = _yt_dlp_bin()
     try:
         r = subprocess.run(
-            ["yt-dlp", "--get-title", "--no-playlist", "-q", "--no-warnings", url],
-            capture_output=True, text=True, timeout=10, env=_subprocess_env(),
+            [ytdlp, "-f", _FMT, "--print", "%(title)s|||%(url)s",
+             "--no-playlist", "-q", "--no-warnings",
+             "--extractor-args", "youtube:player_client=web_safari", url],
+            capture_output=True, text=True, timeout=60, env=_subprocess_env(),
         )
         if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", url],
-            capture_output=True, text=True, timeout=10, env=_subprocess_env(),
-        )
-        if r.returncode == 0:
-            tags = json.loads(r.stdout).get("format", {}).get("tags", {})
-            for key in ("title", "Title", "icy-title", "StreamTitle"):
-                if tags.get(key):
-                    return tags[key]
+            line = r.stdout.strip().splitlines()[0]
+            if "|||" in line:
+                title, stream = line.split("|||", 1)
+                if stream.strip():
+                    return stream.strip(), title.strip()
     except Exception:
         pass
-    return ""
+    return url, ""
 
 
-# ── MPV controller ────────────────────────────────────────────────────────────
+# ── AVFoundation player ───────────────────────────────────────────────────────
 
-class MPV:
+class Player:
     def __init__(self):
-        self._sock   = f"/tmp/sp-mpv-{os.getpid()}.sock"
-        self._proc   = None
-        self.playing = False
-        self.paused  = False
-        self._lock   = threading.Lock()
+        self._player  = None
+        self.playing  = False
+        self.paused   = False
+        self._lock    = threading.Lock()
         self._meta: dict = {}
         self.duration: float | None = None
 
     def play(self, url: str) -> None:
         self.stop()
-        self._proc = subprocess.Popen(
-            [_MPV, "--no-video", "--no-terminal", "--really-quiet",
-             f"--input-ipc-server={self._sock}", url],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=_subprocess_env(), cwd="/",
-        )
+        ns_url       = NSURL.URLWithString_(url)
+        item         = AVPlayerItem.playerItemWithURL_(ns_url)
+        self._player = AVPlayer.playerWithPlayerItem_(item)
+        self._player.setVolume_(1.0)
+        self._player.play()
         self.playing = True
         self.paused  = False
         threading.Thread(target=self._poll, daemon=True).start()
 
-    def _cmd(self, obj: dict):
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(1.5)
-            s.connect(self._sock)
-            s.sendall(json.dumps(obj).encode() + b"\n")
-            buf = b""
-            while b"\n" not in buf:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                buf += chunk
-            s.close()
-            return json.loads(buf.decode().strip().splitlines()[0])
-        except Exception:
+    def error(self) -> str | None:
+        """Return a human-readable error string if the current item failed, else None."""
+        if not self._player:
             return None
+        item = self._player.currentItem()
+        if item and item.status() == 2:  # AVPlayerItemStatusFailed
+            err = item.error()
+            return str(err) if err else "unknown playback error"
+        return None
 
     def _poll(self) -> None:
         time.sleep(2)
-        while self.playing:
-            r = self._cmd({"command": ["get_property", "metadata"]})
-            if r and r.get("error") == "success":
-                with self._lock:
-                    self._meta = r.get("data") or {}
-            d = self._cmd({"command": ["get_property", "duration"]})
-            if d and d.get("error") == "success" and isinstance(d.get("data"), (int, float)):
-                self.duration = float(d["data"])
+        while self.playing and self._player:
+            item = self._player.currentItem()
+            if item:
+                # Timed metadata — covers ICY/StreamTitle on HTTP streams
+                try:
+                    meta = {}
+                    timed = item.timedMetadata()
+                    if timed:
+                        for m in timed:
+                            k = str(m.commonKey() or m.key() or "")
+                            v = m.stringValue() or ""
+                            if k and v:
+                                meta[k] = str(v)
+                    with self._lock:
+                        self._meta = meta
+                except Exception:
+                    pass
+                # Duration (live streams return kCMTimeIndefinite — skip those)
+                try:
+                    dur = CMTimeGetSeconds(item.duration())
+                    if dur and 0 < dur < 1e9:
+                        self.duration = dur
+                except Exception:
+                    pass
             time.sleep(4)
 
     def toggle_pause(self) -> None:
-        self._cmd({"command": ["cycle", "pause"]})
+        if not self._player:
+            return
+        if self.paused:
+            self._player.play()
+        else:
+            self._player.pause()
         self.paused = not self.paused
 
     def stop(self) -> None:
-        if self._proc:
-            self._proc.terminate()
-            try:
-                self._proc.wait(2)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-            self._proc = None
+        if self._player:
+            self._player.pause()
+            self._player = None
         self.playing  = False
         self.paused   = False
         self.duration = None
+        with self._lock:
+            self._meta = {}
 
     @property
     def active(self) -> bool:
@@ -177,7 +201,7 @@ class MPV:
     def live_title(self) -> str:
         with self._lock:
             m = dict(self._meta)
-        for k in ("title", "icy-title", "StreamTitle", "TITLE"):
+        for k in ("title", "icy-title", "StreamTitle", "TITLE", "commonTitle"):
             if m.get(k):
                 return m[k]
         return ""
@@ -261,11 +285,15 @@ class App(tk.Tk):
         cfg          = load_config()
         self._url    = cfg["last_url"]
         self._ttl    = cfg["last_title"]
-        self.mpv     = MPV()
-        self.eq      = Equalizer()
+        self.player     = Player()
+        self.eq         = Equalizer()
         self._play_start:    float | None = None
         self._paused_total:  float        = 0.0
         self._paused_since:  float | None = None
+        self._resolving: bool             = False
+        self._cache: dict[str, tuple[str, str, float]] = {}  # url -> (stream, title, expires)
+        if self._url:
+            threading.Thread(target=self._bg_pre_resolve, args=(self._url,), daemon=True).start()
         self._build()
         self._tick()
 
@@ -284,7 +312,6 @@ class App(tk.Tk):
         F_SM = ("Menlo", 9)
 
         # ── State label — floats at traffic-light level via place() ──────────
-        # y is refined by _setup_native_window once the real titlebar height is known
         self._state_lbl = tk.Label(self, text="■  STOPPED", font=F, fg=DIM, bg=BG)
         self._state_lbl.place(relx=1.0, x=-P, y=6, anchor="ne")
 
@@ -309,7 +336,7 @@ class App(tk.Tk):
         )
         self._url_entry.pack(side="left", fill="x", expand=True,
                              padx=(6, 0), ipady=4)
-        self._url_entry.bind("<Return>", self._on_play)
+        self._url_entry.bind("<Return>", self._on_entry_return)
         self._url_entry.bind("<Escape>", lambda _: self.focus_set())
         self._url_entry.bind("<FocusIn>",  self._url_focus_in)
         self._url_entry.bind("<FocusOut>", self._url_focus_out)
@@ -367,7 +394,6 @@ class App(tk.Tk):
             w.bind("<Button-1>",  self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
 
-        # Fix window width after widgets are placed
         self.update_idletasks()
         h = self.winfo_reqheight()
         self.geometry(f"{self.W}x{h}")
@@ -424,9 +450,9 @@ class App(tk.Tk):
     # ── State helpers ─────────────────────────────────────────────────────────
 
     def _set_state(self) -> None:
-        if self.mpv.active:
+        if self.player.active:
             self._state_lbl.config(text="▶  PLAYING", fg=GREEN)
-        elif self.mpv.paused:
+        elif self.player.paused:
             self._state_lbl.config(text="⏸  PAUSED",  fg=YELLOW)
         else:
             self._state_lbl.config(text="■  STOPPED", fg=DIM)
@@ -446,35 +472,79 @@ class App(tk.Tk):
     def _elapsed(self) -> float:
         if not self._play_start:
             return 0.0
-        base = self._paused_since if (self.mpv.paused and self._paused_since) else time.time()
+        base = self._paused_since if (self.player.paused and self._paused_since) else time.time()
         return base - self._play_start - self._paused_total
+
+    def _on_entry_return(self, _=None):
+        self._on_play()
+        return "break"  # stop event from propagating to the window <Return> binding
 
     def _on_play(self, _=None) -> None:
         url = self._url_var.get().strip()
         if not url or url == self._placeholder:
             return
         self._url = url
-        self._set_status("connecting…")
-        self.eq.active    = True
-        self._play_start  = time.time()
+        self.player.stop()
+        self.eq.active     = False
+        self._play_start   = None
         self._paused_total = 0.0
         self._paused_since = None
-        self.mpv.play(url)
+        self._resolving = True
         self._set_state()
+        self._set_status("resolving…")
+        self._ttl_lbl.config(text="—")
         self.focus_set()
-        threading.Thread(target=self._bg_title, args=(url,), daemon=True).start()
+        threading.Thread(target=self._bg_resolve_and_play, args=(url,), daemon=True).start()
+
+    def _bg_pre_resolve(self, url: str) -> None:
+        stream, title = resolve_and_get_title(url)
+        if stream and stream != url:
+            self._cache[url] = (stream, title, _stream_expires(stream))
+
+    def _bg_resolve_and_play(self, url: str) -> None:
+        cached = self._cache.get(url)
+        if cached:
+            stream, title, expires = cached
+            if expires == 0 or expires > time.time() + 300:
+                self.after(0, lambda: self._start_play(url, stream, title))
+                # Refresh cache in background for next play
+                threading.Thread(target=self._bg_pre_resolve, args=(url,), daemon=True).start()
+                return
+        stream, title = resolve_and_get_title(url)
+        if stream and stream != url:
+            self._cache[url] = (stream, title, _stream_expires(stream))
+        self.after(0, lambda: self._start_play(url, stream, title))
+
+    def _start_play(self, original_url: str, stream_url: str, title: str) -> None:
+        self._resolving = False
+        try:
+            self.player.play(stream_url)
+        except Exception as exc:
+            self._set_status(f"error: {exc}")
+            self.eq.active = False
+            self._set_state()
+            return
+        self.eq.active     = True
+        self._play_start   = time.time()
+        self._paused_total = 0.0
+        self._paused_since = None
+        self._set_state()
+        ttl = title or original_url.rstrip("/").split("/")[-1] or original_url
+        self._ttl = ttl
+        save_config(original_url, ttl)
+        self._ttl_lbl.config(text=ttl)
 
     def _on_space(self, _=None) -> None:
         if self.focus_get() is self._url_entry:
             return
-        if self.mpv.playing:
-            if not self.mpv.paused:
+        if self.player.playing:
+            if not self.player.paused:
                 self._paused_since = time.time()
             elif self._paused_since is not None:
                 self._paused_total += time.time() - self._paused_since
                 self._paused_since  = None
-            self.mpv.toggle_pause()
-            self.eq.active = self.mpv.active
+            self.player.toggle_pause()
+            self.eq.active = self.player.active
             self._set_state()
 
     def _focus_url(self, _=None) -> None:
@@ -498,14 +568,6 @@ class App(tk.Tk):
         self.wm_attributes("-topmost", self._topmost)
         dot = "●" if self._topmost else "○"
         self._hint_lbl.config(text=f"[↵] play  [⎵] pause  [U] url  [T] top {dot}")
-
-    def _bg_title(self, url: str) -> None:
-        self.after(0, lambda: self._ttl_lbl.config(text="fetching…"))
-        t   = fetch_title(url)
-        ttl = t or url.rstrip("/").split("/")[-1] or url
-        self._ttl = ttl
-        save_config(url, ttl)
-        self.after(0, lambda: self._ttl_lbl.config(text=ttl))
 
     # ── Animation ─────────────────────────────────────────────────────────────
 
@@ -547,42 +609,34 @@ class App(tk.Tk):
 
     def _tick(self) -> None:
         self._draw_eq()
-        live = self.mpv.live_title()
+        live = self.player.live_title()
         if live and live != self._ttl_lbl.cget("text"):
             self._ttl_lbl.config(text=live)
-        if self.mpv.playing and self._play_start:
+        err = self.player.error()
+        if err:
+            self.player.stop()
+            self.eq.active   = False
+            self._play_start = None
+            self._set_state()
+            self._set_status(f"error: {err}")
+        elif self.player.playing and self._play_start:
             elapsed = self._fmt_time(self._elapsed())
-            dur = self.mpv.duration
+            dur = self.player.duration
             text = f"{elapsed} / {self._fmt_time(dur)}" if dur else elapsed
             self._status_lbl.config(text=text)
-        elif not self.mpv.playing and self._play_start is None:
+        elif not self.player.playing and self._play_start is None and not self._resolving:
             self._status_lbl.config(text="press Enter to play")
         self.after(TICK_MS, self._tick)
 
     def _on_close(self) -> None:
-        self.mpv.stop()
+        self.player.stop()
         self._play_start = None
         self.quit()
         self.destroy()
 
 
 def main() -> None:
-    if not _check_mpv():
-        return
     App().mainloop()
-
-
-def _check_mpv() -> bool:
-    try:
-        subprocess.run(["mpv", "--version"], capture_output=True, timeout=3, env=_subprocess_env())
-        return True
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        import tkinter.messagebox as mb
-        root = tk.Tk()
-        root.withdraw()
-        mb.showerror("Stream Player", "mpv is required.\n\nbrew install mpv")
-        root.destroy()
-        return False
 
 
 if __name__ == "__main__":
