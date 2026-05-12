@@ -14,9 +14,55 @@ from pathlib import Path
 
 os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")
 
+import objc
 from Foundation import NSURL
 from AVFoundation import AVPlayer, AVPlayerItem
 from CoreMedia import CMTimeGetSeconds
+
+# Load MediaPlayer framework for remote command / now-playing integration.
+# pyobjc-framework-MediaPlayer is not always installed, so we load the bundle
+# manually and fall back silently if unavailable.
+_MP_OK = False
+_MPRemoteCommandCenter = None
+_MPNowPlayingInfoCenter = None
+try:
+    _MP: dict = {}
+    objc.loadBundle(
+        "MediaPlayer",
+        bundle_path="/System/Library/Frameworks/MediaPlayer.framework",
+        module_globals=_MP,
+    )
+    _MPRemoteCommandCenter   = _MP["MPRemoteCommandCenter"]
+    _MPNowPlayingInfoCenter  = _MP["MPNowPlayingInfoCenter"]
+    _MP_OK = True
+except Exception:
+    pass
+
+# Known string constants from the MediaPlayer SDK.
+_MP_TITLE         = "title"
+_MP_PLAYBACK_RATE = "MPNowPlayingInfoPropertyPlaybackRate"
+_MP_ELAPSED       = "MPNowPlayingInfoPropertyElapsedPlaybackTime"
+
+
+# Helper ObjC object that receives remote-command callbacks via addTarget:action:
+# and forwards them to a Python callable.  We define it only when the framework
+# loaded successfully so the NSObject import doesn't fail in degenerate envs.
+if _MP_OK:
+    from AppKit import NSObject as _NSObject
+
+    class _CommandHandler(_NSObject):  # type: ignore[name-defined]
+        def initWithCallback_(self, cb):
+            self = objc.super(_CommandHandler, self).init()
+            if self is None:
+                return None
+            self._cb = cb
+            return self
+
+        # Signature: NSInteger (id, SEL, id) — MPRemoteCommandHandlerStatus return.
+        def handleCommand_(self, event):
+            self._cb()
+            return 0  # MPRemoteCommandHandlerStatusSuccess
+        handleCommand_ = objc.selector(handleCommand_, signature=b"q@:@")
 
 
 def _subprocess_env():
@@ -294,6 +340,7 @@ class App(tk.Tk):
         if self._url:
             threading.Thread(target=self._bg_pre_resolve, args=(self._url,), daemon=True).start()
         self._build()
+        self._setup_remote_commands()
         self._tick()
 
     def _build(self) -> None:
@@ -456,6 +503,54 @@ class App(tk.Tk):
 
     # ── State helpers ─────────────────────────────────────────────────────────
 
+    def _setup_remote_commands(self) -> None:
+        if not _MP_OK:
+            return
+        # _remote_cmd: 0 = nothing, 1 = toggle, 2 = play, 3 = pause.
+        # Written from the ObjC callback thread (no tkinter/Tcl interaction),
+        # read and cleared on the main thread in _tick().  Any Python GIL
+        # interaction with Tcl from the callback thread crashes Python 3.13
+        # (PyEval_RestoreThread gets a NULL tstate on the main thread).
+        self._remote_cmd = 0
+        try:
+            center = _MPRemoteCommandCenter.sharedCommandCenter()
+
+            def on_toggle():
+                self._remote_cmd = 1
+
+            def on_play():
+                self._remote_cmd = 2
+
+            def on_pause():
+                self._remote_cmd = 3
+
+            h_toggle = _CommandHandler.alloc().initWithCallback_(on_toggle)
+            h_play   = _CommandHandler.alloc().initWithCallback_(on_play)
+            h_pause  = _CommandHandler.alloc().initWithCallback_(on_pause)
+
+            center.togglePlayPauseCommand().addTarget_action_(h_toggle, b"handleCommand:")
+            center.playCommand().addTarget_action_(h_play,   b"handleCommand:")
+            center.pauseCommand().addTarget_action_(h_pause, b"handleCommand:")
+
+            self._remote_handlers = (h_toggle, h_play, h_pause)
+        except Exception:
+            self._remote_cmd = 0
+
+    def _update_now_playing(self) -> None:
+        if not _MP_OK:
+            return
+        try:
+            info: dict = {}
+            title = self._ttl_lbl.cget("text")
+            if title and title != "—":
+                info[_MP_TITLE] = title
+            info[_MP_PLAYBACK_RATE] = 1.0 if self.player.active else 0.0
+            if self.player.active or self.player.paused:
+                info[_MP_ELAPSED] = self._elapsed()
+            _MPNowPlayingInfoCenter.defaultCenter().setNowPlayingInfo_(info or None)
+        except Exception:
+            pass
+
     def _set_state(self) -> None:
         if self.player.active:
             self._state_lbl.config(text="▶  PLAYING", fg=GREEN)
@@ -463,6 +558,7 @@ class App(tk.Tk):
             self._state_lbl.config(text="⏸  PAUSED",  fg=YELLOW)
         else:
             self._state_lbl.config(text="■  STOPPED", fg=DIM)
+        self._update_now_playing()
 
     def _set_status(self, text: str) -> None:
         self._status_lbl.config(text=text)
@@ -616,10 +712,19 @@ class App(tk.Tk):
                                    fill=PEAK_CLR, outline="")
 
     def _tick(self) -> None:
+        # Drain remote-command flag set by the ObjC media-key callback.
+        cmd, self._remote_cmd = self._remote_cmd, 0
+        if cmd == 1:
+            self._on_space()
+        elif cmd == 2 and self.player.paused:
+            self._on_space()
+        elif cmd == 3 and self.player.active:
+            self._on_space()
         self._draw_eq()
         live = self.player.live_title()
         if live and live != self._ttl_lbl.cget("text"):
             self._ttl_lbl.config(text=live)
+            self._update_now_playing()
         err = self.player.error()
         if err:
             self.player.stop()

@@ -26,6 +26,16 @@ def _gradient(zone):
     hi = min(lo + 1, len(GRADIENT) - 1)
     return _lerp_color(GRADIENT[lo], GRADIENT[hi], idx - lo)
 
+def _in_squircle(x, y, size, radius):
+    """Return True if (x,y) is inside the rounded-rect with given corner radius."""
+    cx, cy = x - size / 2 + 0.5, y - size / 2 + 0.5
+    ax, ay = abs(cx), abs(cy)
+    half = size / 2
+    inner = half - radius
+    if ax <= inner or ay <= inner:
+        return True
+    return (ax - inner) ** 2 + (ay - inner) ** 2 <= radius ** 2
+
 def _make_pixels(size):
     n = 7
     pad = size * 0.13
@@ -43,9 +53,13 @@ def _make_pixels(size):
         y_bot = size - pad
         bars.append((x1, x1 + bar_w, y_bot - bar_h, y_bot))
 
+    radius = size * 0.225  # macOS standard squircle radius
+
     buf = bytearray(size * size * 4)
     for y in range(size):
         for x in range(size):
+            if not _in_squircle(x, y, size, radius):
+                continue  # leave alpha=0 (transparent)
             r, g, b = BG
             for bx1, bx2, y_top, y_bot in bars:
                 if bx1 <= x < bx2 and y_top <= y < y_bot:
