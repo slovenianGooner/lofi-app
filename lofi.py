@@ -309,9 +309,10 @@ class Equalizer:
 # ── App window ────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
-    W    = 500
-    EQ_H = 130
-    PAD  = 16
+    W      = 500
+    EQ_H   = 130
+    PAD    = 16
+    MINI_H = 34
 
     def __init__(self):
         super().__init__()
@@ -337,6 +338,8 @@ class App(tk.Tk):
         self._paused_since:  float | None = None
         self._resolving: bool             = False
         self._cache: dict[str, tuple[str, str, float]] = {}
+        self._nswin   = None
+        self._mini    = False
         if self._url:
             threading.Thread(target=self._bg_pre_resolve, args=(self._url,), daemon=True).start()
         self._build()
@@ -394,6 +397,7 @@ class App(tk.Tk):
         # ── Title row ─────────────────────────────────────────────────────────
         ttl_row = tk.Frame(self, bg=BG)
         ttl_row.pack(fill="x", padx=P, pady=(0, 4))
+        self._ttl_row = ttl_row
 
         tk.Label(ttl_row, text="TTL ›", font=F, fg=DIM, bg=BG, width=5,
                  anchor="w").pack(side="left")
@@ -416,18 +420,20 @@ class App(tk.Tk):
         self._canvas.pack(fill="x", padx=P, pady=(10, 8))
 
         # ── Divider ───────────────────────────────────────────────────────────
-        tk.Frame(self, height=1, bg=BORDER).pack(fill="x", padx=P)
+        self._divider = tk.Frame(self, height=1, bg=BORDER)
+        self._divider.pack(fill="x", padx=P)
 
         # ── Status bar ────────────────────────────────────────────────────────
         bot = tk.Frame(self, bg=BG)
         bot.pack(fill="x", padx=P, pady=(6, P))
+        self._bot = bot
 
         self._status_lbl = tk.Label(
             bot, text="press Enter to play",
             font=F_SM, fg=DIM, bg=BG, anchor="w",
         )
         self._status_lbl.pack(side="left")
-        self._hint_lbl = tk.Label(bot, text="[↵] play  [⎵] pause  [U] url  [S] save  [T] top ●",
+        self._hint_lbl = tk.Label(bot, text="[↵] play  [⎵] pause  [U] url  [S] save  [M] mini  [T] top ●",
                  font=F_SM, fg=DIM, bg=BG)
         self._hint_lbl.pack(side="right")
 
@@ -440,12 +446,43 @@ class App(tk.Tk):
         self.bind("T",        self._toggle_topmost)
         self.bind("s",        self._save_station)
         self.bind("S",        self._save_station)
+        self.bind("m",        self._toggle_mini)
+        self.bind("M",        self._toggle_mini)
         for i in range(1, 6):
             self.bind(str(i), lambda e, n=i: self._play_station_num(n))
         self._topmost = True
 
+        # ── Mini bar frame (hidden until M is pressed) ────────────────────────
+        MINI_PAD_X = 10
+        MINI_PAD_Y = 5
+        EQ_MINI_W  = 140
+        self._mini_frame = tk.Frame(self, bg=BG, height=self.MINI_H)
+        _mini_inner = tk.Frame(self._mini_frame, bg=BG)
+        _mini_inner.pack(fill="both", expand=True,
+                         padx=MINI_PAD_X, pady=MINI_PAD_Y)
+        self._mini_canvas = tk.Canvas(
+            _mini_inner, width=EQ_MINI_W,
+            bg=BG, highlightthickness=0, bd=0,
+        )
+        self._mini_canvas.pack(side="left", fill="y")
+        self._mini_state_lbl = tk.Label(
+            _mini_inner, text="■", font=F, fg=DIM, bg=BG, padx=6,
+        )
+        self._mini_state_lbl.pack(side="left")
+        self._mini_title_lbl = tk.Label(
+            _mini_inner, text="—", font=F, fg=FG, bg=BG, anchor="w",
+        )
+        self._mini_title_lbl.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self._mini_hint_lbl = tk.Label(
+            _mini_inner, text="[M] expand  [⎵] pause",
+            font=F_SM, fg=DIM, bg=BG,
+        )
+        self._mini_hint_lbl.pack(side="right")
+
         # ── Drag-to-move (all non-interactive surfaces) ───────────────────────
-        for w in (self, self._canvas, bot):
+        for w in (self, self._canvas, bot,
+                  self._mini_frame, _mini_inner, self._mini_canvas,
+                  self._mini_title_lbl, self._mini_state_lbl, self._mini_hint_lbl):
             w.bind("<Button-1>",  self._drag_start)
             w.bind("<B1-Motion>", self._drag_move)
 
@@ -471,6 +508,7 @@ class App(tk.Tk):
                     self.after(150, lambda: self._setup_native_window(attempt + 1))
                 return
 
+            self._nswin = nswin
             dark = NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua")
             bg   = NSColor.colorWithRed_green_blue_alpha_(
                 0x0c/255, 0x0c/255, 0x16/255, 1.0
@@ -554,10 +592,13 @@ class App(tk.Tk):
     def _set_state(self) -> None:
         if self.player.active:
             self._state_lbl.config(text="▶  PLAYING", fg=GREEN)
+            self._mini_state_lbl.config(text="▶", fg=GREEN)
         elif self.player.paused:
             self._state_lbl.config(text="⏸  PAUSED",  fg=YELLOW)
+            self._mini_state_lbl.config(text="⏸", fg=YELLOW)
         else:
             self._state_lbl.config(text="■  STOPPED", fg=DIM)
+            self._mini_state_lbl.config(text="■", fg=DIM)
         self._update_now_playing()
 
     def _set_status(self, text: str) -> None:
@@ -671,11 +712,93 @@ class App(tk.Tk):
         self._topmost = not self._topmost
         self.wm_attributes("-topmost", self._topmost)
         dot = "●" if self._topmost else "○"
-        self._hint_lbl.config(text=f"[↵] play  [⎵] pause  [U] url  [S] save  [T] top {dot}")
+        self._hint_lbl.config(text=f"[↵] play  [⎵] pause  [U] url  [S] save  [M] mini  [T] top {dot}")
+
+    # ── Mini / status-bar mode ────────────────────────────────────────────────
+
+    def _toggle_mini(self, _=None) -> None:
+        if self.focus_get() is self._url_entry:
+            return
+        self._mini = not self._mini
+        if self._mini:
+            self._enter_mini()
+        else:
+            self._exit_mini()
+
+    def _enter_mini(self) -> None:
+        self._pre_mini_geometry = self.geometry()
+        self._state_lbl.place_forget()
+        self._url_row.pack_forget()
+        self._ttl_row.pack_forget()
+        self._stations_frame.pack_forget()
+        self._canvas.pack_forget()
+        self._divider.pack_forget()
+        self._bot.pack_forget()
+        self._mini_frame.pack(fill="both", expand=True)
+        self._set_nswin_borderless(True)
+        x, tk_y, w = self._mini_bar_geometry()
+        self.resizable(True, False)
+        self.geometry(f"{w}x{self.MINI_H}+{x}+{tk_y}")
+
+    def _exit_mini(self) -> None:
+        self._mini_frame.pack_forget()
+        P = self.PAD
+        self._url_row.pack(fill="x", padx=P, pady=(36, 3))
+        self._ttl_row.pack(fill="x", padx=P, pady=(0, 4))
+        self._stations_frame.pack(fill="x", padx=P)
+        self._canvas.pack(fill="x", padx=P, pady=(10, 8))
+        self._divider.pack(fill="x", padx=P)
+        self._bot.pack(fill="x", padx=P, pady=(6, P))
+        self._state_lbl.place(relx=1.0, x=-P, y=6, anchor="ne")
+        self._set_nswin_borderless(False)
+        self.resizable(False, False)
+        self._resize_window()
+        # Restore position from before mini mode (keep saved x/y, recalc height)
+        saved = getattr(self, "_pre_mini_geometry", None)
+        if saved:
+            import re as _re
+            m = _re.match(r"\d+x\d+\+(-?\d+)\+(-?\d+)", saved)
+            if m:
+                self.update_idletasks()
+                h = self.winfo_reqheight()
+                self.geometry(f"{self.W}x{h}+{m.group(1)}+{m.group(2)}")
+        self.after(200, self._setup_native_window)
+
+    def _mini_bar_geometry(self) -> tuple[int, int, int]:
+        """Return (x, tk_y, width) to dock mini bar just above the macOS dock."""
+        try:
+            from AppKit import NSScreen
+            vf = NSScreen.mainScreen().visibleFrame()
+            sh = self.winfo_screenheight()
+            x      = int(vf.origin.x)
+            tk_y   = sh - int(vf.origin.y) - self.MINI_H
+            width  = int(vf.size.width)
+            return x, tk_y, width
+        except Exception:
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+            return 0, sh - self.MINI_H, sw
+
+    def _set_nswin_borderless(self, borderless: bool) -> None:
+        try:
+            if self._nswin is None:
+                return
+            if borderless:
+                self._nswin.setStyleMask_(0)  # NSWindowStyleMaskBorderless
+            else:
+                TITLED = 1; CLOSABLE = 2; MINIATURIZABLE = 4; FULL_SIZE = 1 << 15
+                self._nswin.setStyleMask_(TITLED | CLOSABLE | MINIATURIZABLE | FULL_SIZE)
+                self._nswin.setTitlebarAppearsTransparent_(True)
+                self._nswin.setTitleVisibility_(1)
+        except Exception:
+            pass
 
     # ── Animation ─────────────────────────────────────────────────────────────
 
     def _draw_eq(self) -> None:
+        if self._mini:
+            self._draw_eq_mini()
+            return
         c = self._canvas
         c.delete("all")
         cw = c.winfo_width()
@@ -711,6 +834,26 @@ class App(tk.Tk):
                 c.create_rectangle(x1, peak_y, x2, peak_y + 2,
                                    fill=PEAK_CLR, outline="")
 
+    def _draw_eq_mini(self) -> None:
+        c = self._mini_canvas
+        c.delete("all")
+        cw = c.winfo_width()
+        ch = c.winfo_height()
+        if cw < 4 or ch < 2:
+            return
+        vals, _ = self.eq.snapshot()
+        n    = len(vals)  # 32 bars
+        gap  = 1
+        bar_w = max(2, (cw - gap * (n - 1)) // n)
+        total = n * bar_w + (n - 1) * gap
+        x0    = max(0, (cw - total) // 2)
+        for i, v in enumerate(vals):
+            x1     = x0 + i * (bar_w + gap)
+            x2     = x1 + bar_w
+            bar_px = max(1, int(v * ch))
+            c.create_rectangle(x1, ch - bar_px, x2, ch,
+                               fill=_eq_color(v), outline="")
+
     def _tick(self) -> None:
         # Drain remote-command flag set by the ObjC media-key callback.
         cmd, self._remote_cmd = self._remote_cmd, 0
@@ -725,6 +868,9 @@ class App(tk.Tk):
         if live and live != self._ttl_lbl.cget("text"):
             self._ttl_lbl.config(text=live)
             self._update_now_playing()
+        cur_title = self._ttl_lbl.cget("text")
+        if self._mini_title_lbl.cget("text") != cur_title:
+            self._mini_title_lbl.config(text=cur_title)
         err = self.player.error()
         if err:
             self.player.stop()
@@ -782,6 +928,8 @@ class App(tk.Tk):
         self._resize_window()
 
     def _resize_window(self) -> None:
+        if self._mini:
+            return
         self.update_idletasks()
         h = self.winfo_reqheight()
         self.geometry(f"{self.W}x{h}")
