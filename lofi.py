@@ -144,8 +144,7 @@ def resolve_and_get_title(url: str) -> tuple[str, str]:
     try:
         r = subprocess.run(
             [ytdlp, "-f", _FMT, "--print", "%(title)s|||%(url)s",
-             "--no-playlist", "-q", "--no-warnings",
-             "--extractor-args", "youtube:player_client=web_safari", url],
+             "--no-playlist", "-q", "--no-warnings", url],
             capture_output=True, text=True, timeout=60, env=_subprocess_env(),
         )
         if r.returncode == 0 and r.stdout.strip():
