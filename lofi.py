@@ -17,7 +17,7 @@ os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH"
 import objc
 from Foundation import NSURL
 from AVFoundation import AVPlayer, AVPlayerItem
-from CoreMedia import CMTimeGetSeconds
+from CoreMedia import CMTimeGetSeconds, CMTimeMakeWithSeconds
 
 # Load MediaPlayer framework for remote command / now-playing integration.
 # pyobjc-framework-MediaPlayer is not always installed, so we load the bundle
@@ -218,6 +218,23 @@ class Player:
                     pass
             time.sleep(4)
 
+    def current_time(self) -> float:
+        if not self._player:
+            return 0.0
+        try:
+            return float(CMTimeGetSeconds(self._player.currentTime()))
+        except Exception:
+            return 0.0
+
+    def seek(self, position: float) -> None:
+        if not self._player or self.duration is None:
+            return
+        try:
+            t = CMTimeMakeWithSeconds(max(0.0, min(position, self.duration)), 600)
+            self._player.seekToTime_(t)
+        except Exception:
+            pass
+
     def toggle_pause(self) -> None:
         if not self._player:
             return
@@ -337,8 +354,10 @@ class App(tk.Tk):
         self._paused_since:  float | None = None
         self._resolving: bool             = False
         self._cache: dict[str, tuple[str, str, float]] = {}
-        self._nswin   = None
-        self._mini    = False
+        self._nswin      = None
+        self._mini       = False
+        self._scrubbing  = False
+        self._scrub_frac = 0.0
         if self._url:
             threading.Thread(target=self._bg_pre_resolve, args=(self._url,), daemon=True).start()
         self._build()
@@ -416,7 +435,17 @@ class App(tk.Tk):
             self, height=self.EQ_H, bg=BG,
             highlightthickness=0, bd=0,
         )
-        self._canvas.pack(fill="x", padx=P, pady=(10, 8))
+        self._canvas.pack(fill="x", padx=P, pady=(10, 4))
+
+        # ── Scrubber ──────────────────────────────────────────────────────────
+        self._scrub_canvas = tk.Canvas(
+            self, height=14, bg=BG,
+            highlightthickness=0, bd=0, cursor="hand2",
+        )
+        self._scrub_canvas.pack(fill="x", padx=P, pady=(0, 6))
+        self._scrub_canvas.bind("<Button-1>",        self._scrub_click)
+        self._scrub_canvas.bind("<B1-Motion>",       self._scrub_drag)
+        self._scrub_canvas.bind("<ButtonRelease-1>", self._scrub_release)
 
         # ── Divider ───────────────────────────────────────────────────────────
         self._divider = tk.Frame(self, height=1, bg=BORDER)
@@ -468,22 +497,23 @@ class App(tk.Tk):
             _mini_inner, text="■", font=F, fg=DIM, bg=BG, padx=6,
         )
         self._mini_state_lbl.pack(side="left")
-        self._mini_title_lbl = tk.Label(
-            _mini_inner, text="—", font=F, fg=FG, bg=BG, anchor="w",
-        )
-        self._mini_title_lbl.pack(side="left", fill="x", expand=True, padx=(4, 0))
         self._mini_hint_lbl = tk.Label(
             _mini_inner, text="[M] expand  [⎵] pause",
             font=F_SM, fg=DIM, bg=BG,
         )
         self._mini_hint_lbl.pack(side="right")
-
-        # ── Drag-to-move (all non-interactive surfaces) ───────────────────────
-        for w in (self, self._canvas, bot,
-                  self._mini_frame, _mini_inner, self._mini_canvas,
-                  self._mini_title_lbl, self._mini_state_lbl, self._mini_hint_lbl):
-            w.bind("<Button-1>",  self._drag_start)
-            w.bind("<B1-Motion>", self._drag_move)
+        self._mini_title_lbl = tk.Label(
+            _mini_inner, text="—", font=F, fg=FG, bg=BG, anchor="w",
+        )
+        self._mini_title_lbl.pack(side="left", padx=(4, 0))
+        self._mini_scrub_canvas = tk.Canvas(
+            _mini_inner, width=400,
+            bg=BG, highlightthickness=0, bd=0, cursor="hand2",
+        )
+        self._mini_scrub_canvas.pack(side="left", padx=(8, 0))
+        self._mini_scrub_canvas.bind("<Button-1>",        self._scrub_click)
+        self._mini_scrub_canvas.bind("<B1-Motion>",       self._scrub_drag)
+        self._mini_scrub_canvas.bind("<ButtonRelease-1>", self._scrub_release)
 
         self.update_idletasks()
         h = self.winfo_reqheight()
@@ -516,7 +546,7 @@ class App(tk.Tk):
             nswin.setStyleMask_(nswin.styleMask() | FULL_SIZE)
             nswin.setTitlebarAppearsTransparent_(True)
             nswin.setTitleVisibility_(1)
-            nswin.setMovableByWindowBackground_(True)
+            nswin.setMovableByWindowBackground_(False)
             nswin.setBackgroundColor_(bg)
             nswin.setAppearance_(dark)
 
@@ -528,15 +558,6 @@ class App(tk.Tk):
             self._url_row.pack_configure(pady=(max(28, titlebar_h) + 8, 3))
         except Exception:
             pass
-
-    # ── Drag-to-move ──────────────────────────────────────────────────────────
-
-    def _drag_start(self, event) -> None:
-        self._drag_ox = event.x_root - self.winfo_x()
-        self._drag_oy = event.y_root - self.winfo_y()
-
-    def _drag_move(self, event) -> None:
-        self.geometry(f"+{event.x_root - self._drag_ox}+{event.y_root - self._drag_oy}")
 
     # ── State helpers ─────────────────────────────────────────────────────────
 
@@ -731,6 +752,7 @@ class App(tk.Tk):
         self._ttl_row.pack_forget()
         self._stations_frame.pack_forget()
         self._canvas.pack_forget()
+        self._scrub_canvas.pack_forget()
         self._divider.pack_forget()
         self._bot.pack_forget()
         self._mini_frame.pack(fill="both", expand=True)
@@ -745,7 +767,8 @@ class App(tk.Tk):
         self._url_row.pack(fill="x", padx=P, pady=(36, 3))
         self._ttl_row.pack(fill="x", padx=P, pady=(0, 4))
         self._stations_frame.pack(fill="x", padx=P)
-        self._canvas.pack(fill="x", padx=P, pady=(10, 8))
+        self._canvas.pack(fill="x", padx=P, pady=(10, 4))
+        self._scrub_canvas.pack(fill="x", padx=P, pady=(0, 6))
         self._divider.pack(fill="x", padx=P)
         self._bot.pack(fill="x", padx=P, pady=(6, P))
         self._state_lbl.place(relx=1.0, x=-P, y=6, anchor="ne")
@@ -853,6 +876,71 @@ class App(tk.Tk):
             c.create_rectangle(x1, ch - bar_px, x2, ch,
                                fill=_eq_color(v), outline="")
 
+    def _draw_scrubber(self) -> None:
+        c = self._scrub_canvas
+        c.delete("all")
+        cw = c.winfo_width()
+        ch = c.winfo_height()
+        if cw < 4:
+            return
+        ty = ch // 2
+        c.create_rectangle(0, ty - 1, cw, ty + 1, fill=DIM, outline="")
+        dur = self.player.duration
+        if not dur:
+            return
+        frac = self._scrub_frac if self._scrubbing else min(1.0, self.player.current_time() / dur)
+        fx = int(frac * cw)
+        if fx > 0:
+            c.create_rectangle(0, ty - 1, fx, ty + 1, fill=ACCENT, outline="")
+        r = 5
+        c.create_oval(fx - r, ty - r, fx + r, ty + r, fill=ACCENT, outline="")
+
+    def _draw_scrubber_mini(self) -> None:
+        c = self._mini_scrub_canvas
+        c.delete("all")
+        cw = c.winfo_width()
+        ch = c.winfo_height()
+        if cw < 4 or ch < 2:
+            return
+        ty = ch // 2
+        c.create_rectangle(0, ty - 1, cw, ty + 1, fill=DIM, outline="")
+        dur = self.player.duration
+        if not dur:
+            return
+        frac = self._scrub_frac if self._scrubbing else min(1.0, self.player.current_time() / dur)
+        fx = int(frac * cw)
+        if fx > 0:
+            c.create_rectangle(0, ty - 1, fx, ty + 1, fill=ACCENT, outline="")
+        r = 3
+        c.create_oval(fx - r, ty - r, fx + r, ty + r, fill=ACCENT, outline="")
+
+    def _scrub_click(self, event) -> None:
+        if not self.player.duration:
+            return
+        self._scrubbing = True
+        w = event.widget.winfo_width()
+        self._scrub_frac = max(0.0, min(1.0, event.x / w)) if w > 0 else 0.0
+
+    def _scrub_drag(self, event) -> None:
+        if not self._scrubbing or not self.player.duration:
+            return
+        w = event.widget.winfo_width()
+        self._scrub_frac = max(0.0, min(1.0, event.x / w)) if w > 0 else 0.0
+
+    def _scrub_release(self, event) -> None:
+        if not self._scrubbing:
+            return
+        self._scrubbing = False
+        if not self.player.duration:
+            return
+        pos = self._scrub_frac * self.player.duration
+        self.player.seek(pos)
+        now = time.time()
+        if self.player.paused and self._paused_since is not None:
+            self._play_start = self._paused_since - pos - self._paused_total
+        elif self._play_start is not None:
+            self._play_start = now - pos - self._paused_total
+
     def _tick(self) -> None:
         # Drain remote-command flag set by the ObjC media-key callback.
         cmd, self._remote_cmd = self._remote_cmd, 0
@@ -863,6 +951,10 @@ class App(tk.Tk):
         elif cmd == 3 and self.player.active:
             self._on_space()
         self._draw_eq()
+        if self._mini:
+            self._draw_scrubber_mini()
+        else:
+            self._draw_scrubber()
         live = self.player.live_title()
         if live and live != self._ttl_lbl.cget("text"):
             self._ttl_lbl.config(text=live)
